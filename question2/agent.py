@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-import uuid
+import re
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import expanded_help_center_blob, title_index
+from shared.kb import article_ids, load_article
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
@@ -18,116 +18,114 @@ class TicketResolution:
     kb_article: str
 
 
+def _triage_code(ticket: dict, order: dict, thread: str) -> str:
+    """Deterministic summary of ticket facts in code (zero LLM calls)."""
+    ptype = order.get("product_type", "unknown")
+    facts = [
+        f"product_type: {ptype}",
+        f"delivered_days_ago: {order.get('delivered_days_ago')}",
+        f"subscription_age_days: {order.get('subscription_age_days')}",
+        f"opened: {order.get('opened')}",
+        f"license_revealed: {order.get('license_revealed')}",
+        f"customized: {order.get('customized')}",
+        f"damage_reported: {order.get('damage_reported')}",
+    ]
+    return f"FACTS:\n" + "\n".join(facts) + f"\nCUSTOMER_THREAD:\n{thread}"
+
+
+def _retrieve_articles_code(order: dict, thread: str) -> list[tuple[str, str]]:
+    """
+    Code-based retrieval: rank articles by keyword overlap and domain signals.
+    Loads only relevant articles, avoiding the 210k-token expanded blob.
+    """
+    all_ids = article_ids()
+    scores: dict[str, float] = {aid: 0.0 for aid in all_ids}
+    thread_lower = thread.lower()
+
+    # Domain signal boosts
+    ptype = order.get("product_type")
+    if ptype == "subscription" or "subscription" in thread_lower or "cancel" in thread_lower:
+        scores["subscription-cooling-off"] = scores.get("subscription-cooling-off", 0.0) + 15.0
+
+    if order.get("license_revealed") or "license" in thread_lower or "digital" in thread_lower or "ebook" in thread_lower:
+        scores["digital-license-no-refund"] = scores.get("digital-license-no-refund", 0.0) + 12.0
+
+    if order.get("customized") or "custom" in thread_lower or "engrav" in thread_lower:
+        scores["custom-items-no-replace"] = scores.get("custom-items-no-replace", 0.0) + 12.0
+
+    if order.get("damage_reported") or "damaged" in thread_lower or "cracked" in thread_lower or "broken" in thread_lower or "replacement" in thread_lower or "replace" in thread_lower:
+        scores["damage-replacement-7-days"] = scores.get("damage-replacement-7-days", 0.0) + 10.0
+
+    if "refund" in thread_lower or "return" in thread_lower or ptype == "physical":
+        scores["returns-within-30-days"] = scores.get("returns-within-30-days", 0.0) + 5.0
+
+    # Keyword overlap
+    for aid in all_ids:
+        text = load_article(aid).lower()
+        words = re.findall(r"\w+", text)
+        for w in set(words):
+            if len(w) > 3 and w in thread_lower:
+                scores[aid] += 1.0
+
+    # Sort descending and take top 2
+    sorted_articles = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    top_ids = [aid for aid, score in sorted_articles[:2]]
+    return [(aid, load_article(aid)) for aid in top_ids]
+
+
 class SupportPipeline:
-    """Same product as Question 1 — triage, retrieve, compose, audit."""
+    """
+    Refactored production pipeline:
+    - triage (code)
+    - retrieve (code)
+    - compose (single lean LLM decision call)
+    - audit (code validation)
+    """
 
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
         self.llm = LlmClient(self.session)
-        self.help_center = expanded_help_center_blob()
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
         thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
+        compact_snapshot = json.dumps(order, separators=(",", ":"))
 
-        triage = self._triage(ticket_id, thread, snapshot)
-        retrieved = self._retrieve(triage, snapshot)
-        draft = self._compose(ticket_id, thread, snapshot, triage, retrieved)
-        final = self._audit(ticket_id, thread, snapshot, triage, retrieved, draft)
-        parsed = parse_resolution(final)
-        return TicketResolution(parsed.action, parsed.kb_article)
+        # Node 1: Triage (Code)
+        triage_summary = _triage_code(ticket, order, thread)
 
-    def _triage(self, ticket_id: str, thread: str, snapshot: str) -> str:
+        # Node 2: Retrieve (Code)
+        retrieved = _retrieve_articles_code(order, thread)
+        retrieved_blob = "\n\n".join(f"--- {aid} ---\n{body}" for aid, body in retrieved)
+
+        # Node 3: Compose (LLM)
         messages = [
             ChatMessage(
                 "system",
-                "\n".join(
-                    [
-                        f"trace-{uuid.uuid4()}",
-                        "Triage node: restate the ticket step by step and list candidate kb articles.",
-                        f"ARTICLE TITLES:\n{title_index(500)}",
-                        self.help_center[:120_000],
-                    ]
-                ),
+                "You are ShopAssist support copilot. Determine ticket resolution.\n"
+                "Output JSON with action, kb_article, customer_reply.\n\n"
+                f"RELEVANT KNOWLEDGE ARTICLES:\n{retrieved_blob}",
             ),
             ChatMessage(
                 "user",
-                f"TICKET {ticket_id}\nTHREAD:\n{thread}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
+                f"TICKET: {ticket_id}\n"
+                f"TRIAGE:\n{triage_summary}\n"
+                f"ORDER_SNAPSHOT:\n{compact_snapshot}\nEND_SNAPSHOT",
             ),
         ]
-        return self.llm.chat("triage", messages)
+        completion = self.llm.chat("compose", messages)
+        parsed = parse_resolution(completion)
 
-    def _retrieve(self, triage: str, snapshot: str) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Retrieve node: print full text of the eight most relevant help articles.",
-            ),
-            ChatMessage(
-                "user",
-                f"TRIAGE:\n{triage}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ),
-        ]
-        return self.llm.chat("retrieve", messages)
+        # Node 4: Audit (Code Validation)
+        action = parsed.action
+        kb_article = parsed.kb_article
+        valid_actions = {"REFUND", "REPLACE", "SEND_ARTICLE", "ESCALATE_TIER2"}
+        top_retrieved_id = retrieved[0][0] if retrieved else "returns-within-30-days"
 
-    def _compose(
-        self,
-        ticket_id: str,
-        thread: str,
-        snapshot: str,
-        triage: str,
-        retrieved: str,
-    ) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Compose node: full reasoning, then JSON with action, kb_article, customer_reply.",
-            ),
-            ChatMessage(
-                "user",
-                "\n\n".join(
-                    [
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                        f"TRIAGE AGAIN:\n{triage}",
-                    ]
-                ),
-            ),
-        ]
-        return self.llm.chat("compose", messages)
+        if action not in valid_actions or kb_article not in article_ids():
+            # Safer fallback: escalate to Tier-2 citing the top retrieved context article
+            action = "ESCALATE_TIER2"
+            kb_article = top_retrieved_id
 
-    def _audit(
-        self,
-        ticket_id: str,
-        thread: str,
-        snapshot: str,
-        triage: str,
-        retrieved: str,
-        draft: str,
-    ) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Audit node: double-check policy, restate ticket, rewrite JSON output.",
-            ),
-            ChatMessage(
-                "user",
-                "\n\n".join(
-                    [
-                        self.help_center[:80_000],
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"DRAFT:\n{draft}",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                    ]
-                ),
-            ),
-        ]
-        return self.llm.chat("audit", messages)
+        return TicketResolution(action, kb_article)
